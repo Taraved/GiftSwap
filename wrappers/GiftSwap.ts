@@ -36,6 +36,7 @@ export const Constants = {
     nftTransferMin: toNano('0.05'), // NFT_TRANSFER_MIN: сколько прикладываем к переводу NFT
     gasReserve: toNano('0.01'), // GAS_RESERVE: запас контракта на газ и комиссии
     withdrawKeep: toNano('0.02'), // WITHDRAW_KEEP: остаток после Withdraw (плата за хранение)
+    nftReturnMin: toNano('0.01'), // NFT_RETURN_MIN: с меньшей суммой в уведомлении ненужный NFT не возвращается
     withdrawMin: toNano('0.005'), // WITHDRAW_MIN: меньший остаток сверх WITHDRAW_KEEP Withdraw не выводит
     settleTimeout: 24 * 3600, // SETTLE_TIMEOUT, секунды: через столько после Buy можно вызвать Settle
 };

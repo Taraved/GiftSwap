@@ -62,10 +62,10 @@ describe('GiftSwap', () => {
     });
 
     // Имитация: NFT-контракт `from` шлёт нашему контракту уведомление OwnershipAssigned.
-    async function notify(from: SandboxContract<TreasuryContract>, prevOwner: Address) {
+    async function notify(from: SandboxContract<TreasuryContract>, prevOwner: Address, value = toNano('0.05')) {
         return from.send({
             to: giftSwap.address,
-            value: toNano('0.05'),
+            value,
             bounce: false,
             body: ownershipAssignedBody(prevOwner),
         });
@@ -115,6 +115,32 @@ describe('GiftSwap', () => {
         return tx.outMessages.get(index)!.body.beginParse().loadUint(32);
     }
 
+    // Просьбы GiftSwap к адресу `to` перевести NFT (op transfer): кому и куда вернуть излишек.
+    function transferRequests(transactions: Transaction[], to: Address) {
+        return transactions.flatMap((tx) => {
+            const info = tx.inMessage?.info;
+            if (info?.type !== 'internal' || !info.src.equals(giftSwap.address) || !info.dest.equals(to)) {
+                return [];
+            }
+            const body = tx.inMessage!.body.beginParse();
+            if (body.remainingBits < 32 || body.loadUint(32) !== Opcodes.nftTransfer) {
+                return [];
+            }
+            body.loadUint(64); // query_id
+            return [{ newOwner: body.loadAddress(), responseDestination: body.loadAddress() }];
+        });
+    }
+
+    const balanceOf = async (address: Address) => (await blockchain.getContract(address)).balance;
+
+    // Приводит контракт в состояние Sold.
+    async function sell() {
+        await deposit();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        await confirm();
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
+    }
+
     // ---------- Базовое ----------
 
     it('should deploy in WaitingNft state', async () => {
@@ -136,49 +162,109 @@ describe('GiftSwap', () => {
     });
 
     // ---------- Атака: поддельное уведомление / чужой NFT ----------
+    // Уведомление, которое не является депозитом, сделку не меняет. Если с ним пришло не меньше
+    // NFT_RETURN_MIN, NFT отправляется обратно prevOwner за счёт TON самого уведомления.
 
-    it('rejects a fake notification from a random wallet', async () => {
+    it('attack: a fake notification from a random wallet changes nothing; the "return" goes to the sender, not to our NFT', async () => {
+        const before = await balanceOf(giftSwap.address);
+
         const result = await notify(attacker, seller.address);
-        expect(result.transactions).toHaveTransaction({
-            from: attacker.address,
-            to: giftSwap.address,
-            success: false,
-            exitCode: Errors.notExpectedNft,
-        });
+
+        // Просьба «перевести NFT» ушла отправителю уведомления, то есть самому злоумышленнику.
+        expect(transferRequests(result.transactions, attacker.address)).toHaveLength(1);
+        expect(transferRequests(result.transactions, nft.address)).toHaveLength(0);
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.WaitingNft);
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(before - toNano('0.0001'));
     });
 
-    it('rejects a notification from a different NFT (foreign NFT)', async () => {
-        const result = await notify(otherNft, seller.address);
-        expect(result.transactions).toHaveTransaction({
-            from: otherNft.address,
-            to: giftSwap.address,
-            success: false,
-            exitCode: Errors.notExpectedNft,
-        });
-        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.WaitingNft);
-    });
-
-    it('rejects the right NFT if it was sent by someone other than the seller', async () => {
-        const result = await notify(nft, attacker.address);
-        expect(result.transactions).toHaveTransaction({
-            from: nft.address,
-            to: giftSwap.address,
-            success: false,
-            exitCode: Errors.notSeller,
-        });
-        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.WaitingNft);
-    });
-
-    it('rejects a second deposit notification', async () => {
+    it('attack: a fake notification while the NFT is for sale cannot make the contract move that NFT', async () => {
         await deposit();
-        const result = await notify(nft, seller.address);
-        expect(result.transactions).toHaveTransaction({
+
+        const result = await notify(attacker, attacker.address);
+
+        expect(transferRequests(result.transactions, nft.address)).toHaveLength(0);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.ForSale);
+    });
+
+    it('a foreign NFT is sent back to its previous owner', async () => {
+        const result = await notify(otherNft, attacker.address);
+
+        expect(result.transactions).toHaveTransaction({ from: otherNft.address, to: giftSwap.address, success: true });
+        const requests = transferRequests(result.transactions, otherNft.address);
+        expect(requests).toHaveLength(1);
+        expect(requests[0].newOwner.equals(attacker.address)).toBe(true);
+        expect(requests[0].responseDestination.equals(attacker.address)).toBe(true);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.WaitingNft);
+    });
+
+    it('the right NFT sent by someone other than the seller goes back to that sender, not to the seller', async () => {
+        const result = await notify(nft, attacker.address);
+
+        const requests = transferRequests(result.transactions, nft.address);
+        expect(requests).toHaveLength(1);
+        expect(requests[0].newOwner.equals(attacker.address)).toBe(true);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.WaitingNft);
+    });
+
+    it('after the sale, the NFT sent back to the contract is returned to the sender', async () => {
+        await sell();
+
+        const result = await notify(nft, buyer.address);
+
+        const requests = transferRequests(result.transactions, nft.address);
+        expect(requests).toHaveLength(1);
+        expect(requests[0].newOwner.equals(buyer.address)).toBe(true);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
+    });
+
+    it('rejects a second deposit notification and never gives away the NFT of the deal (ForSale, Transferring)', async () => {
+        await deposit();
+        const forSale = await notify(nft, attacker.address);
+        expect(forSale.transactions).toHaveTransaction({
             from: nft.address,
             to: giftSwap.address,
             success: false,
             exitCode: Errors.wrongState,
         });
+
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        const transferring = await notify(nft, attacker.address);
+        expect(transferring.transactions).toHaveTransaction({
+            from: nft.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.wrongState,
+        });
+
+        expect(transferRequests([...forSale.transactions, ...transferring.transactions], nft.address)).toHaveLength(0);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
+    });
+
+    it('with less than NFT_RETURN_MIN there is nothing to pay the return with: rejected as before (101, 102, 103)', async () => {
+        const tiny = Constants.nftReturnMin - 1n;
+        const expectRejected = (transactions: Transaction[], from: Address, exitCode: number) => {
+            expect(transactions).toHaveTransaction({ from, to: giftSwap.address, success: false, exitCode });
+            expect(transferRequests(transactions, from)).toHaveLength(0);
+        };
+
+        expectRejected((await notify(otherNft, attacker.address, tiny)).transactions, otherNft.address, Errors.notExpectedNft);
+        expectRejected((await notify(nft, attacker.address, tiny)).transactions, nft.address, Errors.notSeller);
+        await sell();
+        expectRejected((await notify(nft, buyer.address, tiny)).transactions, nft.address, Errors.wrongState);
+    });
+
+    it('attack: a spam of fake notifications does not lower the contract balance', async () => {
+        await sell(); // на контракте остаток продавца
+        const before = await balanceOf(giftSwap.address);
+
+        for (let i = 0; i < 3; i++) {
+            await notify(attacker, attacker.address, Constants.nftReturnMin);
+            await notify(attacker, attacker.address, toNano('0.5'));
+            await notify(attacker, attacker.address, Constants.nftReturnMin - 1n);
+        }
+
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(before - toNano('0.0001'));
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
     });
 
     // ---------- Покупка ----------

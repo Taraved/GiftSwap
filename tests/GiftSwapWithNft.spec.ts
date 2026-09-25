@@ -95,16 +95,41 @@ describe('GiftSwap with a TEP-62 NFT', () => {
 
     // ---------- Атаки ----------
 
-    it('attack: a different real NFT is rejected by GiftSwap', async () => {
-        const otherNft = blockchain.openContract(
-            MockNftItem.createFromConfig({ owner: attacker.address }, nftCode),
-        );
+    // Другой NFT, принадлежащий `attacker`.
+    async function deployOtherNft() {
+        const otherNft = blockchain.openContract(MockNftItem.createFromConfig({ owner: attacker.address }, nftCode));
         await otherNft.sendDeploy(deployer.getSender(), toNano('0.05'));
+        return otherNft;
+    }
+
+    it('a different NFT sent by mistake returns to its owner, paid by its own forward_amount (NFT_RETURN_MIN is enough)', async () => {
+        const otherNft = await deployOtherNft();
+        const before = await balanceOf(giftSwap.address);
 
         const result = await otherNft.sendTransfer(attacker.getSender(), toNano('0.1'), {
             newOwner: giftSwap.address,
             responseDestination: attacker.address,
-            forwardAmount: toNano('0.05'),
+            forwardAmount: Constants.nftReturnMin,
+        });
+
+        expect(result.transactions).toHaveTransaction({
+            from: otherNft.address,
+            to: giftSwap.address,
+            op: NftOpcodes.ownershipAssigned,
+            success: true,
+        });
+        expect((await otherNft.getOwner()).equals(attacker.address)).toBe(true);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.WaitingNft);
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(before - toNano('0.0001'));
+    });
+
+    it('a different NFT with a dust forward_amount stays on the contract: nothing to pay the return with (101)', async () => {
+        const otherNft = await deployOtherNft();
+
+        const result = await otherNft.sendTransfer(attacker.getSender(), toNano('0.1'), {
+            newOwner: giftSwap.address,
+            responseDestination: attacker.address,
+            forwardAmount: toNano('0.001'),
         });
 
         expect(result.transactions).toHaveTransaction({
@@ -114,7 +139,39 @@ describe('GiftSwap with a TEP-62 NFT', () => {
             success: false,
             exitCode: Errors.notExpectedNft,
         });
+        expect((await otherNft.getOwner()).equals(giftSwap.address)).toBe(true);
+    });
+
+    it('the right NFT deposited by someone other than the seller goes back to that sender', async () => {
+        await nft.sendTransfer(seller.getSender(), toNano('0.1'), {
+            newOwner: attacker.address,
+            responseDestination: seller.address,
+            forwardAmount: 0n,
+        });
+
+        await nft.sendTransfer(attacker.getSender(), toNano('0.1'), {
+            newOwner: giftSwap.address,
+            responseDestination: attacker.address,
+            forwardAmount: toNano('0.05'),
+        });
+
+        expect((await nft.getOwner()).equals(attacker.address)).toBe(true);
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.WaitingNft);
+    });
+
+    it('after the sale, the buyer sending the NFT back by mistake gets it returned', async () => {
+        await depositNft();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        expect((await nft.getOwner()).equals(buyer.address)).toBe(true);
+
+        await nft.sendTransfer(buyer.getSender(), toNano('0.1'), {
+            newOwner: giftSwap.address,
+            responseDestination: buyer.address,
+            forwardAmount: toNano('0.05'),
+        });
+
+        expect((await nft.getOwner()).equals(buyer.address)).toBe(true);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
     });
 
     it('attack: only the real owner can move the NFT', async () => {

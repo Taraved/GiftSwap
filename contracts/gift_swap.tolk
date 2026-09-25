@@ -44,6 +44,12 @@ const WITHDRAW_KEEP = ton("0.02");
 // Меньший остаток сверх WITHDRAW_KEEP Withdraw не выводит (ERR_NOTHING_TO_WITHDRAW): вывод «пыли»
 // стоил бы продавцу больше, чем он получит.
 const WITHDRAW_MIN = ton("0.005");
+// Сколько TON должно прийти с уведомлением о ненужном NFT, чтобы вернуть его отправителю. Возврат идёт
+// только за счёт этих TON (баланс контракта не тратится): наш газ, пересылка и перевод у NFT.
+// Замер: NFT с обычным балансом (~0.05 TON) возвращается уже с ~0.00073 TON, так что запас больше чем в 10 раз.
+// NFT с малым балансом может потребовать больше и отказать: тогда он просто останется у нас.
+// С суммой меньше NFT_RETURN_MIN уведомление отвергается, NFT тоже остаётся у нас.
+const NFT_RETURN_MIN = ton("0.01");
 
 // ---------- Время ----------
 // Через сколько секунд после Buy можно вызвать Settle. Перевод NFT отправлен с bounce, поэтому при провале
@@ -160,6 +166,26 @@ fun sendNft(
     msg.send(SEND_MODE_PAY_FEES_SEPARATELY);
 }
 
+// Возврат ненужного NFT: просим NFT `nft` перевести себя обратно `prevOwner`. Отправляем всё, что осталось
+// от пришедшего уведомления после оплаты газа (режим 64), поэтому баланс контракта не тратится.
+// Без bounce: если NFT откажет, NFT просто останется у нас, как если бы возврата не было.
+fun returnNft(nft: address, prevOwner: address, queryId: uint64) {
+    val msg = createMessage({
+        bounce: BounceMode.NoBounce,
+        dest: nft,
+        value: 0,
+        body: NftTransfer {
+            queryId: queryId,
+            newOwner: prevOwner,
+            responseDestination: prevOwner,
+            customPayload: null,
+            forwardAmount: 0,
+            forwardPayload: false,
+        },
+    });
+    msg.send(SEND_MODE_CARRY_ALL_REMAINING_MESSAGE_VALUE);
+}
+
 fun sendTon(dest: address, value: coins) {
     val msg = createMessage({
         bounce: BounceMode.NoBounce,
@@ -209,19 +235,37 @@ fun Storage.reopenSale(mutate self) {
 }
 
 // ---------- Обработчики ----------
-fun handleOwnershipAssigned(sender: address, msg: OwnershipAssigned) {
+fun handleOwnershipAssigned(sender: address, value: coins, msg: OwnershipAssigned) {
     var storage = Storage.load();
 
-    // Защита от подделки: уведомление принимаем только от адреса нашего NFT.
-    // Любой может отправить сообщение с таким же кодом операции, но не с чужого адреса.
-    assert (sender == storage.nftAddress) throw ERR_NOT_EXPECTED_NFT;
-    // Защита от повторного депозита.
-    assert (storage.state == State.WaitingNft) throw ERR_WRONG_STATE;
-    // Раз отправитель — наш NFT, prevOwner можно доверять: это тот, кто перевёл NFT.
-    assert (msg.prevOwner == storage.seller) throw ERR_NOT_SELLER;
+    // Защита от подделки: депозитом считается только уведомление от адреса нашего NFT
+    // (любой может отправить сообщение с таким же кодом операции, но не с чужого адреса),
+    // пока мы ждём депозит, и только от продавца. Раз отправитель — наш NFT, prevOwner можно доверять.
+    val fromOurNft = sender == storage.nftAddress;
+    if (fromOurNft && storage.state == State.WaitingNft && msg.prevOwner == storage.seller) {
+        storage.state = State.ForSale;
+        storage.save();
+        return;
+    }
 
-    storage.state = State.ForSale;
-    storage.save();
+    // NFT сделки, пока он выставлен или продаётся, никогда не отдаём по уведомлению.
+    // (Настоящий NFT такое уведомление прислать не может: его владелец — мы.)
+    assert (!fromOurNft || (storage.state != State.ForSale && storage.state != State.Transferring)) throw ERR_WRONG_STATE;
+
+    // Остальное — ненужный нам NFT: чужой NFT, наш NFT не от продавца или присланный уже после сделки.
+    // Возвращаем его prevOwner за счёт TON уведомления. Просьбу о переводе шлём ОТПРАВИТЕЛЮ уведомления,
+    // а не на nftAddress: поддельное уведомление заставит «перевестись» только кошелёк самого подделывателя.
+    // Если TON на возврат не хватает, отвергаем уведомление, как раньше (NFT останется на контракте).
+    if (value < NFT_RETURN_MIN) {
+        if (!fromOurNft) {
+            throw ERR_NOT_EXPECTED_NFT;
+        }
+        if (storage.state == State.WaitingNft) {
+            throw ERR_NOT_SELLER;
+        }
+        throw ERR_WRONG_STATE;
+    }
+    returnNft(sender, msg.prevOwner, msg.queryId);
 }
 
 fun handleBuy(sender: address, value: coins) {
@@ -342,7 +386,7 @@ fun handleWithdraw(sender: address, value: coins) {
 fun onInternalMessage(in: InMessage) {
     val msg = lazy AllowedMessage.fromSlice(in.body);
     match (msg) {
-        OwnershipAssigned => handleOwnershipAssigned(in.senderAddress, msg),
+        OwnershipAssigned => handleOwnershipAssigned(in.senderAddress, in.valueCoins, msg),
         Excesses => handleExcesses(in.senderAddress, in.valueCoins, msg),
         Buy => handleBuy(in.senderAddress, in.valueCoins),
         Cancel => handleCancel(in.senderAddress, in.valueCoins),
