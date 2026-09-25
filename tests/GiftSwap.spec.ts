@@ -37,6 +37,8 @@ describe('GiftSwap', () => {
 
     beforeEach(async () => {
         blockchain = await Blockchain.create();
+        // Фиксированное время: без него плата за хранение зависит от того, успела ли пройти секунда между транзакциями.
+        blockchain.now = 1_800_000_000;
 
         deployer = await blockchain.treasury('deployer');
         seller = await blockchain.treasury('seller');
@@ -223,7 +225,7 @@ describe('GiftSwap', () => {
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
     });
 
-    it('rejects a second deposit notification and never gives away the NFT of the deal (ForSale, Transferring)', async () => {
+    it('rejects a second deposit notification in ForSale and never gives away the NFT for sale', async () => {
         await deposit();
         const forSale = await notify(nft, attacker.address);
         expect(forSale.transactions).toHaveTransaction({
@@ -233,17 +235,25 @@ describe('GiftSwap', () => {
             exitCode: Errors.wrongState,
         });
 
-        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
-        const transferring = await notify(nft, attacker.address);
-        expect(transferring.transactions).toHaveTransaction({
-            from: nft.address,
-            to: giftSwap.address,
-            success: false,
-            exitCode: Errors.wrongState,
-        });
+        expect(transferRequests(forSale.transactions, nft.address)).toHaveLength(0);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.ForSale);
+    });
 
-        expect(transferRequests([...forSale.transactions, ...transferring.transactions], nft.address)).toHaveLength(0);
+    it('during a purchase, our NFT sent to the contract is returned to its sender (our transfer was already done)', async () => {
+        // Пока контракт владеет NFT, никто другой не может прислать его нам. Значит, уведомление от нашего NFT
+        // во время покупки приходит, только когда наш перевод покупателю уже выполнен: NFT принадлежит отправителю.
+        await deposit();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+
+        const result = await notify(nft, buyer.address);
+
+        const requests = transferRequests(result.transactions, nft.address);
+        expect(requests).toHaveLength(1);
+        expect(requests[0].newOwner.equals(buyer.address)).toBe(true);
+        // Сделку это не меняет: её закроет Excesses или Settle.
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
+        await confirm();
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
     });
 
     it('with less than NFT_RETURN_MIN there is nothing to pay the return with: rejected as before (101, 102, 103)', async () => {

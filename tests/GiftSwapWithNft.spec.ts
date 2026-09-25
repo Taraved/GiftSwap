@@ -31,6 +31,8 @@ describe('GiftSwap with a TEP-62 NFT', () => {
 
     beforeEach(async () => {
         blockchain = await Blockchain.create();
+        // Фиксированное время: без него плата за хранение зависит от того, успела ли пройти секунда между транзакциями.
+        blockchain.now = 1_800_000_000;
 
         deployer = await blockchain.treasury('deployer');
         seller = await blockchain.treasury('seller');
@@ -188,6 +190,25 @@ describe('GiftSwap with a TEP-62 NFT', () => {
             exitCode: NftErrors.notOwner,
         });
         expect((await nft.getOwner()).equals(seller.address)).toBe(true);
+    });
+
+    it('the buyer sends the NFT back while the purchase still waits for confirmation: it is returned, settle completes the sale', async () => {
+        // Найдено property-тестом: раньше такой NFT отвергался (103) и застревал в контракте навсегда.
+        await depositNft();
+        await nft.sendSetSkipExcesses(deployer.getSender(), toNano('0.05'), true);
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
+
+        await nft.sendTransfer(buyer.getSender(), toNano('0.1'), {
+            newOwner: giftSwap.address,
+            responseDestination: buyer.address,
+            forwardAmount: toNano('0.05'),
+        });
+        expect((await nft.getOwner()).equals(buyer.address)).toBe(true);
+
+        await giftSwap.sendSettle(buyer.getSender(), Constants.settleMin);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
+        expect((await nft.getOwner()).equals(buyer.address)).toBe(true);
     });
 
     // ---------- Покупка ----------
@@ -789,7 +810,7 @@ describe('GiftSwap with a TEP-62 NFT', () => {
 
     it('WITHDRAW_KEEP covers 10 years of storage fees (re-measure it after any noticeable contract change)', async () => {
         await depositNft();
-        blockchain.now = (blockchain.now ?? Math.floor(Date.now() / 1000)) + 10 * 365 * 24 * 3600;
+        blockchain.now = blockchain.now! + 10 * 365 * 24 * 3600;
 
         const result = await giftSwap.sendCancel(seller.getSender(), toNano('0.1'));
 
