@@ -25,10 +25,13 @@ export const Opcodes = {
     ownershipAssigned: 0x05138d91, // TEP-62: уведомление от NFT
     nftTransfer: 0x5fcc3d14, // TEP-62: перевод NFT
     excesses: 0xd53276db, // TEP-62: NFT подтверждает успешный перевод
+    getStaticData: 0x2fcb26a2, // TEP-62: запрос к NFT (им Settle проверяет, что перевод обработан)
+    reportStaticData: 0x8b771735, // TEP-62: ответ NFT на get_static_data
     buy: 0x0b5a0001,
     cancel: 0x0b5a0002,
     withdraw: 0x0b5a0003,
     settle: 0x0b5a0004,
+    refund: 0x0b5a0005,
 };
 
 // Должно совпадать с константами в contracts/gift_swap.tolk (замеры газа: см. историю коммитов шага 4)
@@ -38,7 +41,8 @@ export const Constants = {
     withdrawKeep: toNano('0.02'), // WITHDRAW_KEEP: остаток после Withdraw (плата за хранение)
     nftReturnMin: toNano('0.01'), // NFT_RETURN_MIN: с меньшей суммой в уведомлении ненужный NFT не возвращается
     withdrawMin: toNano('0.005'), // WITHDRAW_MIN: меньший остаток сверх WITHDRAW_KEEP Withdraw не выводит
-    settleTimeout: 24 * 3600, // SETTLE_TIMEOUT, секунды: через столько после Buy можно вызвать Settle
+    settleMin: toNano('0.01'), // SETTLE_MIN: минимум TON в Settle (оплачивает запрос к NFT и ответ)
+    refundTimeout: 30 * 24 * 3600, // REFUND_TIMEOUT, секунды: через столько после первого Settle без ответа NFT работает Refund
 };
 
 // Должно совпадать с ERR_* в contracts/gift_swap.tolk
@@ -77,6 +81,17 @@ export const buyBody = (): Cell => beginCell().storeUint(Opcodes.buy, 32).endCel
 export const cancelBody = (): Cell => beginCell().storeUint(Opcodes.cancel, 32).endCell();
 export const withdrawBody = (): Cell => beginCell().storeUint(Opcodes.withdraw, 32).endCell();
 export const settleBody = (): Cell => beginCell().storeUint(Opcodes.settle, 32).endCell();
+export const refundBody = (): Cell => beginCell().storeUint(Opcodes.refund, 32).endCell();
+
+// Тело ответа NFT на get_static_data (TEP-62): query_id, index, collection. Нужно для тестов.
+export function reportStaticDataBody(queryId: bigint, index = 0n, collection: Address | null = null): Cell {
+    return beginCell()
+        .storeUint(Opcodes.reportStaticData, 32)
+        .storeUint(queryId, 64)
+        .storeUint(index, 256)
+        .storeAddress(collection)
+        .endCell();
+}
 
 export type NftTransferParams = {
     newOwner: Address;
@@ -122,7 +137,7 @@ export type SwapInfo = {
     buyer: Address | null;
     paid: bigint;
     queryId: bigint; // query_id текущего перевода NFT (его выбирает контракт); 0, если перевода нет
-    settleAfter: number; // unixtime, с которого можно вызвать Settle; 0, если покупки нет
+    refundAfter: number; // unixtime, с которого работает Refund; 0, если Settle ещё не отправлял запрос к NFT
 };
 
 export class GiftSwap implements Contract {
@@ -172,12 +187,23 @@ export class GiftSwap implements Contract {
         });
     }
 
-    // Settle может отправить любой, но только через Constants.settleTimeout секунд после Buy.
+    // Settle может отправить любой и в любой момент покупки (value >= Constants.settleMin):
+    // контракт спросит NFT get_static_data, и ответ NFT завершит сделку.
     async sendSettle(provider: ContractProvider, via: Sender, value: bigint) {
         await provider.internal(via, {
             value,
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: settleBody(),
+        });
+    }
+
+    // Refund может отправить любой, но только через Constants.refundTimeout после первого Settle,
+    // на который NFT так и не ответил: деньги возвращаются покупателю.
+    async sendRefund(provider: ContractProvider, via: Sender, value: bigint) {
+        await provider.internal(via, {
+            value,
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: refundBody(),
         });
     }
 
@@ -191,7 +217,7 @@ export class GiftSwap implements Contract {
             buyer: stack.readAddressOpt(),
             paid: stack.readBigNumber(),
             queryId: stack.readBigNumber(),
-            settleAfter: stack.readNumber(),
+            refundAfter: stack.readNumber(),
         };
     }
 }

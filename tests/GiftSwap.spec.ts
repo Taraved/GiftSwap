@@ -8,6 +8,7 @@ import {
     SwapState,
     ownershipAssignedBody,
     excessesBody,
+    reportStaticDataBody,
 } from '../wrappers/GiftSwap';
 import '@ton/test-utils';
 import { compile } from '@ton/blueprint';
@@ -136,6 +137,11 @@ describe('GiftSwap', () => {
     // Приводит контракт в состояние Sold.
     async function sell() {
         await deposit();
+        await sellAfterDeposit();
+    }
+
+    // Из ForSale в Sold: покупка и подтверждение от NFT.
+    async function sellAfterDeposit() {
         await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
         await confirm();
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
@@ -722,44 +728,59 @@ describe('GiftSwap', () => {
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
     });
 
-    // ---------- Settle: выход из Transferring, если NFT молчит ----------
+    // ---------- Settle: проверочный запрос к NFT вместо ожидания по таймеру ----------
+    // Settle просит NFT get_static_data. Контракт отправил его ПОСЛЕ перевода, а сообщения между двумя
+    // контрактами обрабатываются по порядку (спецификация TON, 2.2.10): NFT сначала обработает перевод,
+    // и его ответ на перевод (bounce или excesses) придёт к нам раньше ответа на запрос. Поэтому ответ
+    // на запрос, пришедший во время покупки, доказывает: перевод обработан и не отвергнут.
 
-    it('settle before the timeout is rejected', async () => {
+    // Просьбы GiftSwap к NFT get_static_data: их query_id.
+    function probes(transactions: Transaction[]) {
+        return transactions.flatMap((tx) => {
+            const info = tx.inMessage?.info;
+            if (info?.type !== 'internal' || !info.src.equals(giftSwap.address) || !info.dest.equals(nft.address)) {
+                return [];
+            }
+            const body = tx.inMessage!.body.beginParse();
+            if (body.remainingBits < 32 || body.loadUint(32) !== Opcodes.getStaticData) {
+                return [];
+            }
+            return [body.loadUintBig(64)];
+        });
+    }
+
+    // Имитация ответа NFT (или подделки от `from`) на get_static_data.
+    async function report(from: SandboxContract<TreasuryContract> = nft, queryId?: bigint) {
+        const id = queryId ?? (await giftSwap.getSwapInfo()).queryId;
+        return from.send({ to: giftSwap.address, value: toNano('0.009'), bounce: false, body: reportStaticDataBody(id) });
+    }
+
+    const NOW = 1_800_000_000;
+    const DAY = 24 * 3600;
+
+    it('settle right after the buy (no waiting) sends get_static_data with the query_id of the transfer', async () => {
+        blockchain.now = NOW;
         await deposit();
         await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        const { queryId } = await giftSwap.getSwapInfo();
 
-        const result = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
+        const result = await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin);
 
-        expect(result.transactions).toHaveTransaction({
-            from: attacker.address,
-            to: giftSwap.address,
-            success: false,
-            exitCode: Errors.tooEarly,
-        });
+        expect(probes(result.transactions)).toEqual([queryId]);
         expect(result.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
-        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
+        const info = await giftSwap.getSwapInfo();
+        expect(info.state).toBe(SwapState.Transferring);
+        expect(info.refundAfter).toBe(NOW + Constants.refundTimeout);
     });
 
-    it('settle works exactly at the deadline (one second earlier it does not) and completes the sale', async () => {
+    it('the answer of the NFT to the probe completes the sale', async () => {
         await deposit();
         await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
-        const { settleAfter } = await giftSwap.getSwapInfo();
-        expect(settleAfter).toBeGreaterThan(0);
+        await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin);
 
-        blockchain.now = settleAfter - 1;
-        const early = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
-        expect(early.transactions).toHaveTransaction({
-            from: attacker.address,
-            to: giftSwap.address,
-            success: false,
-            exitCode: Errors.tooEarly,
-        });
+        const result = await report();
 
-        blockchain.now = settleAfter;
-        const result = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
-
-        // NFT молчал, но bounce не было: перевод считается выполненным. Продавцу платим цену,
-        // покупателю возвращаем излишек без зачёта возврата от NFT (его нет).
+        // Продавцу цена, покупателю излишек без зачёта возврата от NFT (excesses не было).
         expect(result.transactions).toHaveTransaction({ from: giftSwap.address, to: seller.address, value: PRICE });
         expect(result.transactions).toHaveTransaction({
             from: giftSwap.address,
@@ -771,26 +792,79 @@ describe('GiftSwap', () => {
         expect(info.buyer).toBeNull();
         expect(info.paid).toBe(0n);
         expect(info.queryId).toBe(0n);
-        expect(info.settleAfter).toBe(0);
+        expect(info.refundAfter).toBe(0);
     });
 
-    it('settle is still rejected 23 hours after the buy (a congested network can delay the bounce for hours)', async () => {
+    it('a bounced probe also completes the sale: the NFT processed the transfer before it and did not bounce it', async () => {
         await deposit();
-        const boughtAt = Math.floor(Date.now() / 1000);
-        blockchain.now = boughtAt;
         await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
-        expect((await giftSwap.getSwapInfo()).settleAfter).toBeGreaterThanOrEqual(boughtAt + 24 * 3600);
+        await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin);
+        const { queryId } = await giftSwap.getSwapInfo();
 
-        blockchain.now = boughtAt + 23 * 3600;
-        const result = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
+        const result = await blockchain.sendMessage(bouncedTransfer(nft.address, queryId, Opcodes.getStaticData));
 
-        expect(result.transactions).toHaveTransaction({
+        expect(result.transactions).toHaveTransaction({ from: giftSwap.address, to: seller.address, value: PRICE });
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
+    });
+
+    it('order: a transfer bounce that comes before the probe answer refunds the buyer; the answer is then ignored', async () => {
+        await deposit();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin);
+        const { queryId } = await giftSwap.getSwapInfo();
+
+        const bounce = await blockchain.sendMessage(bouncedTransfer(nft.address, queryId));
+        expect(bounce.transactions).toHaveTransaction({
+            from: giftSwap.address,
+            to: buyer.address,
+            value: ENOUGH - Constants.gasReserve,
+        });
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.ForSale);
+
+        const lateAnswer = await report(nft, queryId);
+        expect(lateAnswer.transactions).toHaveTransaction({
+            from: nft.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.wrongState,
+        });
+        expect(lateAnswer.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.ForSale);
+    });
+
+    it('attack: a fake probe answer does not pay the seller (random wallet, foreign query_id, no purchase)', async () => {
+        await deposit();
+        const noPurchase = await report(nft, 0n);
+        expect(noPurchase.transactions).toHaveTransaction({
+            from: nft.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.wrongState,
+        });
+
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        const { queryId } = await giftSwap.getSwapInfo();
+        const fromStranger = await report(attacker, queryId);
+        expect(fromStranger.transactions).toHaveTransaction({
             from: attacker.address,
             to: giftSwap.address,
             success: false,
-            exitCode: Errors.tooEarly,
+            exitCode: Errors.notExpectedNft,
         });
-        expect(result.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
+        const foreignId = await report(nft, queryId + 1n);
+        expect(foreignId.transactions).toHaveTransaction({
+            from: nft.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.wrongQueryId,
+        });
+        const bouncedForeign = await blockchain.sendMessage(
+            bouncedTransfer(nft.address, queryId + 1n, Opcodes.getStaticData),
+        );
+
+        for (const r of [fromStranger, foreignId, bouncedForeign]) {
+            expect(r.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
+        }
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
     });
 
@@ -804,8 +878,7 @@ describe('GiftSwap', () => {
             exitCode: Errors.wrongState,
         });
 
-        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
-        await confirm();
+        await sellAfterDeposit();
         const sold = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
         expect(sold.transactions).toHaveTransaction({
             from: attacker.address,
@@ -813,41 +886,163 @@ describe('GiftSwap', () => {
             success: false,
             exitCode: Errors.wrongState,
         });
-        expect(sold.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
+        expect(probes([...forSale.transactions, ...sold.transactions])).toHaveLength(0);
     });
 
-    it('a late excesses or bounce after settle pays nothing and changes nothing', async () => {
+    it('settle with less than SETTLE_MIN is rejected: the probe and its answer must be paid by the caller', async () => {
         await deposit();
         await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
-        const { queryId, settleAfter } = await giftSwap.getSwapInfo();
-        blockchain.now = settleAfter;
-        await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
 
-        const lateExcesses = await confirm(nft, EXCESS, queryId);
-        expect(lateExcesses.transactions).toHaveTransaction({
-            from: nft.address,
+        const result = await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin - 1n);
+
+        expect(result.transactions).toHaveTransaction({
+            from: attacker.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.wrongAmount,
+        });
+        expect(probes(result.transactions)).toHaveLength(0);
+        expect((await giftSwap.getSwapInfo()).refundAfter).toBe(0);
+    });
+
+    it('attack: a spam of settle calls does not lower the contract balance (the caller pays each probe)', async () => {
+        await deposit();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        const before = await balanceOf(giftSwap.address);
+
+        for (let i = 0; i < 5; i++) {
+            await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin);
+        }
+
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(before - toNano('0.0001'));
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
+    });
+
+    // ---------- Refund: резервный выход, если NFT не отвечает вообще ----------
+
+    it('refund works only 30 days after the FIRST unanswered probe; later settles do not move the deadline', async () => {
+        blockchain.now = NOW;
+        await deposit();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        await giftSwap.sendSettle(buyer.getSender(), Constants.settleMin); // NFT (заглушка) молчит
+
+        blockchain.now = NOW + 10 * DAY;
+        await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin); // не сдвигает срок
+        expect((await giftSwap.getSwapInfo()).refundAfter).toBe(NOW + Constants.refundTimeout);
+
+        blockchain.now = NOW + Constants.refundTimeout - 1;
+        const early = await giftSwap.sendRefund(attacker.getSender(), toNano('0.05'));
+        expect(early.transactions).toHaveTransaction({
+            from: attacker.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.tooEarly,
+        });
+
+        blockchain.now = NOW + Constants.refundTimeout;
+        const result = await giftSwap.sendRefund(attacker.getSender(), toNano('0.05'));
+
+        // Покупателю возвращается всё, кроме того, что ушло на перевод NFT, и запаса на газ.
+        expect(result.transactions).toHaveTransaction({ from: giftSwap.address, to: buyer.address, value: ENOUGH - FEES });
+        expect(result.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
+        const info = await giftSwap.getSwapInfo();
+        expect(info.state).toBe(SwapState.ForSale);
+        expect(info.buyer).toBeNull();
+        expect(info.queryId).toBe(0n);
+        expect(info.refundAfter).toBe(0);
+    });
+
+    it('refund is never possible without a probe, however long the purchase lasts', async () => {
+        blockchain.now = NOW;
+        await deposit();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+
+        blockchain.now = NOW + 365 * DAY;
+        const result = await giftSwap.sendRefund(buyer.getSender(), toNano('0.05'));
+
+        expect(result.transactions).toHaveTransaction({
+            from: buyer.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.tooEarly,
+        });
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
+    });
+
+    it('refund is rejected when no purchase is in progress (ForSale and Sold)', async () => {
+        await deposit();
+        const forSale = await giftSwap.sendRefund(attacker.getSender(), toNano('0.05'));
+        expect(forSale.transactions).toHaveTransaction({
+            from: attacker.address,
             to: giftSwap.address,
             success: false,
             exitCode: Errors.wrongState,
         });
-        expect(lateExcesses.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
 
-        const lateBounce = await blockchain.sendMessage(bouncedTransfer(nft.address, queryId));
-        expect(lateBounce.transactions).not.toHaveTransaction({ from: giftSwap.address, to: buyer.address });
-        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
+        await sellAfterDeposit();
+        const sold = await giftSwap.sendRefund(attacker.getSender(), toNano('0.05'));
+        expect(sold.transactions).toHaveTransaction({
+            from: attacker.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.wrongState,
+        });
+        expect(sold.transactions).not.toHaveTransaction({ from: giftSwap.address, to: buyer.address });
     });
 
-    it('gas budget: settle costs less than GAS_RESERVE / 5', async () => {
+    it('after a refund, a late answer, excesses or bounce pays nothing and changes nothing', async () => {
+        blockchain.now = NOW;
         await deposit();
         await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
-        blockchain.now = (await giftSwap.getSwapInfo()).settleAfter;
+        const { queryId } = await giftSwap.getSwapInfo();
+        await giftSwap.sendSettle(buyer.getSender(), Constants.settleMin);
+        blockchain.now = NOW + Constants.refundTimeout;
+        await giftSwap.sendRefund(buyer.getSender(), toNano('0.05'));
 
-        const result = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
+        const lateAnswer = await report(nft, queryId);
+        const lateExcesses = await confirm(nft, EXCESS, queryId);
+        const lateBounce = await blockchain.sendMessage(bouncedTransfer(nft.address, queryId));
 
-        const fee = result.transactions
-            .filter((tx) => tx.inMessage?.info.type === 'internal' && tx.inMessage.info.dest.equals(giftSwap.address))
-            .reduce((sum, tx) => sum + tx.totalFees.coins, 0n);
-        expect(fee).toBeLessThan(Constants.gasReserve / 5n);
+        for (const r of [lateAnswer, lateExcesses, lateBounce]) {
+            expect(r.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
+            expect(r.transactions).not.toHaveTransaction({ from: giftSwap.address, to: buyer.address });
+        }
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.ForSale);
+    });
+
+    it('reserve: buy + settle + refund does not drain the contract', async () => {
+        blockchain.now = NOW;
+        await deposit();
+        const before = await balanceOf(giftSwap.address);
+
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        await giftSwap.sendSettle(buyer.getSender(), Constants.settleMin);
+        blockchain.now = NOW + Constants.refundTimeout;
+        await giftSwap.sendRefund(buyer.getSender(), toNano('0.05'));
+
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(before);
+    });
+
+    it('gas budget: settle, the answer and refund each cost less than GAS_RESERVE / 5', async () => {
+        const fee = (transactions: Transaction[]) =>
+            transactions
+                .filter((tx) => tx.inMessage?.info.type === 'internal' && tx.inMessage.info.dest.equals(giftSwap.address))
+                .reduce((sum, tx) => sum + tx.totalFees.coins, 0n);
+        blockchain.now = NOW;
+        await deposit();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+
+        expect(fee((await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin)).transactions)).toBeLessThan(
+            Constants.gasReserve / 5n,
+        );
+        blockchain.now = NOW + Constants.refundTimeout;
+        expect(fee((await giftSwap.sendRefund(attacker.getSender(), toNano('0.05'))).transactions)).toBeLessThan(
+            Constants.gasReserve / 5n,
+        );
+
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        await giftSwap.sendSettle(attacker.getSender(), Constants.settleMin);
+        expect(fee((await report()).transactions)).toBeLessThan(Constants.gasReserve / 5n);
     });
 
     // ---------- Прочее ----------

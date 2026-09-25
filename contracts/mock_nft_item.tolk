@@ -1,5 +1,5 @@
 // MockNftItem: ТОЛЬКО ДЛЯ ТЕСТОВ. Упрощённый NFT по стандарту TEP-62:
-// хранит владельца и умеет transfer -> ownership_assigned + excesses.
+// хранит владельца, умеет transfer -> ownership_assigned + excesses и отвечает на get_static_data.
 // Правило достаточности TON скопировано из референсной реализации (баланс - 0.05 - комиссии >= 0).
 // Нужен, чтобы проверять GiftSwap против настоящих сообщений, а не против кошелька-заглушки.
 // Не деплоить на mainnet и не использовать как образец полноценного NFT.
@@ -16,6 +16,7 @@ const MIN_TONS_FOR_STORAGE = ton("0.05");
 struct Storage {
     owner: address
     rejectTransfers: bool   // тестовый переключатель, чтобы заставить transfer падать
+    skipExcesses: bool      // тестовый переключатель: перевод выполняется, но excesses не отправляется
 }
 
 fun Storage.load() {
@@ -48,12 +49,29 @@ struct (0xd53276db) Excesses {
     queryId: uint64
 }
 
+// get_static_data#2fcb26a2 из TEP-62: запрос статических данных NFT (ничего не меняет)
+struct (0x2fcb26a2) GetStaticData {
+    queryId: uint64
+}
+
+// report_static_data#8b771735 из TEP-62: ответ на get_static_data
+struct (0x8b771735) ReportStaticData {
+    queryId: uint64
+    index: uint256
+    collection: address?    // у тестового NFT коллекции нет: addr_none
+}
+
 // ТОЛЬКО ДЛЯ ТЕСТОВ: включает/выключает отказ от переводов (в настоящем NFT такого нет).
 struct (0x0badc0de) SetReject {
     reject: bool
 }
 
-type AllowedMessage = Transfer | SetReject
+// ТОЛЬКО ДЛЯ ТЕСТОВ: включает/выключает отправку excesses после перевода (нестандартное поведение).
+struct (0x0badc0df) SetSkipExcesses {
+    skip: bool
+}
+
+type AllowedMessage = Transfer | GetStaticData | SetReject | SetSkipExcesses
 
 fun handleTransfer(sender: address, forwardFee: coins, msg: Transfer) {
     var storage = Storage.load();
@@ -91,6 +109,9 @@ fun handleTransfer(sender: address, forwardFee: coins, msg: Transfer) {
         notification.send(SEND_MODE_PAY_FEES_SEPARATELY);
     }
 
+    if (storage.skipExcesses) {
+        return;
+    }
     val excess = createMessage({
         bounce: BounceMode.NoBounce,
         dest: msg.responseDestination,
@@ -100,9 +121,26 @@ fun handleTransfer(sender: address, forwardFee: coins, msg: Transfer) {
     excess.send(SEND_MODE_PAY_FEES_SEPARATELY);
 }
 
+// Как в референсе: ответ отправителю запроса со всеми пришедшими TON за вычетом газа (режим 64), без bounce.
+fun handleGetStaticData(sender: address, msg: GetStaticData) {
+    val reply = createMessage({
+        bounce: BounceMode.NoBounce,
+        dest: sender,
+        value: 0,
+        body: ReportStaticData { queryId: msg.queryId, index: 0, collection: null },
+    });
+    reply.send(SEND_MODE_CARRY_ALL_REMAINING_MESSAGE_VALUE);
+}
+
 fun handleSetReject(msg: SetReject) {
     var storage = Storage.load();
     storage.rejectTransfers = msg.reject;
+    storage.save();
+}
+
+fun handleSetSkipExcesses(msg: SetSkipExcesses) {
+    var storage = Storage.load();
+    storage.skipExcesses = msg.skip;
     storage.save();
 }
 
@@ -110,7 +148,9 @@ fun onInternalMessage(in: InMessage) {
     val msg = lazy AllowedMessage.fromSlice(in.body);
     match (msg) {
         Transfer => handleTransfer(in.senderAddress, in.originalForwardFee, msg),
+        GetStaticData => handleGetStaticData(in.senderAddress, msg),
         SetReject => handleSetReject(msg),
+        SetSkipExcesses => handleSetSkipExcesses(msg),
         else => {
             assert (in.body.isEmpty()) throw ERR_UNKNOWN_OP;
         }

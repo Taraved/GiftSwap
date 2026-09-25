@@ -10,8 +10,11 @@
 //       возвращаем излишек покупателю.                              (Sold)
 //   4b. NFT отказался переводиться (bounce): возвращаем деньги
 //       покупателю, продажа снова открыта.                          (ForSale)
-//   4c. NFT молчит (ни Excesses, ни bounce) дольше SETTLE_TIMEOUT: любой может
-//       отправить Settle, и сделка завершается как успешная.        (Sold)
+//   4c. NFT не прислал Excesses: любой может отправить Settle. Контракт спрашивает NFT
+//       get_static_data; ответ NFT (или bounce этого запроса) доказывает, что перевод
+//       обработан без ошибки, и сделка завершается.                  (Sold)
+//   4d. NFT не отвечает вообще: через REFUND_TIMEOUT после первого Settle любой может
+//       отправить Refund, и деньги возвращаются покупателю.          (ForSale)
 //   Если никто не купил, продавец может забрать NFT сообщением Cancel. (Cancelled)
 //   Cancel работает и в WaitingNft: так можно вернуть NFT, отправленный без forward_amount
 //   (состояние при этом не меняется). Остаток TON забирает сообщение Withdraw.
@@ -19,6 +22,10 @@
 // query_id: каждый перевод NFT (при Buy и при Cancel) идёт с query_id, который выбирает САМ контракт
 // (логическое время транзакции, оно уникально). Excesses и bounce принимаются только с этим query_id,
 // поэтому чужое, старое или подделанное сообщение не может сойти за ответ на текущую покупку.
+//
+// Порядок сообщений: если контракт отправил два сообщения одному адресату, адресат обработает их в том же
+// порядке (спецификация блокчейна TON, 2.2.10, FIFO для Hypercube Routing; наши сообщения не идут через IHR).
+// Поэтому ответы NFT на перевод (bounce или Excesses) всегда приходят раньше ответа на запрос из Settle.
 
 // ---------- Коды ошибок ----------
 const ERR_NOT_EXPECTED_NFT = 101;   // сообщение пришло не от нашего NFT
@@ -26,7 +33,7 @@ const ERR_NOT_SELLER = 102;         // NFT прислал не продавец 
 const ERR_WRONG_STATE = 103;        // действие не подходит текущему состоянию
 const ERR_WRONG_AMOUNT = 104;       // приложено слишком мало TON
 const ERR_WRONG_QUERY_ID = 105;     // Excesses не относится к текущему переводу NFT
-const ERR_TOO_EARLY = 106;          // Settle раньше срока
+const ERR_TOO_EARLY = 106;          // Refund раньше срока (или без запроса к NFT)
 const ERR_NOTHING_TO_WITHDRAW = 107; // Withdraw, когда сверх резерва выводить нечего
 const ERR_UNKNOWN_OP = 0xFFFF;      // непонятное сообщение
 
@@ -51,15 +58,21 @@ const WITHDRAW_MIN = ton("0.005");
 // С суммой меньше NFT_RETURN_MIN уведомление отвергается, NFT тоже остаётся у нас.
 const NFT_RETURN_MIN = ton("0.01");
 
-// ---------- Время ----------
-// Через сколько секунд после Buy можно вызвать Settle. Перевод NFT отправлен с bounce, поэтому при провале
-// ответ (bounce) обычно приходит за секунды. Но при сильной перегрузке сети сообщения могут часами стоять
-// в очередях, а Settle, вызванный раньше bounce, заплатил бы продавцу за непереданный NFT. Поэтому срок
-// берём с большим запасом: сутки. Обычному NFT Settle не нужен вовсе: по TEP-62 он всегда присылает Excesses.
-const SETTLE_TIMEOUT = 24 * 3600;
+// Сколько TON должно прийти с Settle: оплачивает запрос к NFT и его ответ (запрос уходит в режиме 64,
+// то есть за счёт этих TON, баланс контракта не тратится). Замер на тестовом NFT: хватает ~0.0011 TON,
+// так что запас примерно в 9 раз.
+const SETTLE_MIN = ton("0.01");
 
-// Код операции перевода NFT (TEP-62). Нужен и здесь, чтобы узнать наш перевод в теле bounce.
+// ---------- Время ----------
+// Резервный выход для NFT, который не отвечает вообще (ни на перевод, ни на запрос из Settle): через столько
+// секунд после ПЕРВОГО Settle любой может отправить Refund, и деньги вернутся покупателю. Стандартный NFT
+// на запрос отвечает всегда, и его ответ закрывает сделку раньше; значит, Refund нужен только
+// нестандартному или сломанному NFT, а его выбрал продавец, поэтому риск такого NFT несёт продавец.
+const REFUND_TIMEOUT = 30 * 24 * 3600;
+
+// Коды операций TEP-62, которые нужны, чтобы узнать наше сообщение в теле bounce.
 const OP_NFT_TRANSFER = 0x5fcc3d14;
+const OP_GET_STATIC_DATA = 0x2fcb26a2;
 
 // ---------- Состояние ----------
 enum State: uint8 {
@@ -74,7 +87,7 @@ enum State: uint8 {
 struct Purchase {
     buyer: address
     paid: coins         // сколько покупатель приложил к Buy
-    startedAt: uint32   // unixtime, когда пришёл Buy (для Settle)
+    probeSentAt: uint32 // unixtime первого Settle (запроса к NFT); 0, если Settle ещё не было. Для Refund
 }
 
 struct Storage {
@@ -95,7 +108,7 @@ struct SwapInfo {
     buyer: address?
     paid: coins
     queryId: uint64         // pendingQueryId
-    settleAfter: uint32     // с какого unixtime работает Settle (0, если покупки нет)
+    refundAfter: uint32     // с какого unixtime работает Refund (0, если Settle ещё не было)
 }
 
 fun Storage.load() {
@@ -120,6 +133,12 @@ struct (0xd53276db) Excesses {
     queryId: uint64
 }
 
+// TEP-62: ответ NFT на get_static_data (запрос из Settle). Нам нужен только query_id.
+struct (0x8b771735) ReportStaticData {
+    queryId: uint64
+    rest: RemainingBitsAndRefs      // index и адрес коллекции: не используем
+}
+
 // Сообщения от пользователей не несут query_id: его выбирает контракт.
 struct (0x0b5a0001) Buy {}
 
@@ -129,9 +148,16 @@ struct (0x0b5a0003) Withdraw {}
 
 struct (0x0b5a0004) Settle {}
 
-type AllowedMessage = OwnershipAssigned | Excesses | Buy | Cancel | Withdraw | Settle
+struct (0x0b5a0005) Refund {}
 
-// ---------- Исходящее сообщение ----------
+type AllowedMessage = OwnershipAssigned | Excesses | ReportStaticData | Buy | Cancel | Withdraw | Settle | Refund
+
+// ---------- Исходящие сообщения ----------
+// TEP-62: запрос статических данных NFT. Ничего не меняет у NFT; нам важен только сам факт ответа.
+struct (0x2fcb26a2) GetStaticData {
+    queryId: uint64
+}
+
 // TEP-62: просьба к NFT-контракту передать себя новому владельцу.
 struct (0x5fcc3d14) NftTransfer {
     queryId: uint64
@@ -195,9 +221,9 @@ fun sendTon(dest: address, value: coins) {
     msg.send(SEND_MODE_PAY_FEES_SEPARATELY);
 }
 
-// ---------- Завершение и откат покупки (общие для Excesses/Settle и для bounce) ----------
+// ---------- Завершение и откат покупки (общие для Excesses, Settle, Refund и bounce) ----------
 // Сделка состоялась: продавцу цена, покупателю возврат.
-// `returned` — сколько TON NFT вернул из наших NFT_TRANSFER_MIN (при Settle это 0: ответа не было).
+// `returned` — сколько TON NFT вернул из наших NFT_TRANSFER_MIN (при Settle это 0: Excesses не было).
 fun Storage.completeSale(mutate self, returned: coins) {
     val purchase = self.purchase!.load();
     val seller = self.seller;
@@ -222,8 +248,11 @@ fun Storage.completeSale(mutate self, returned: coins) {
     }
 }
 
-// Перевод NFT не удался: покупателю деньги назад (минус запас), продажа снова открыта.
-fun Storage.reopenSale(mutate self) {
+// Покупка не состоялась: покупателю деньги назад, продажа снова открыта.
+// Покупатель теряет запас на газ и `keptByNft` — то, что осталось у NFT из NFT_TRANSFER_MIN:
+// при bounce NFT вернул эти TON (0), при Refund не вернул ничего (NFT_TRANSFER_MIN).
+// Результат никогда не отрицателен: handleBuy гарантирует paid >= price + NFT_TRANSFER_MIN + GAS_RESERVE.
+fun Storage.reopenSale(mutate self, keptByNft: coins) {
     val purchase = self.purchase!.load();
 
     self.state = State.ForSale;
@@ -231,7 +260,7 @@ fun Storage.reopenSale(mutate self) {
     self.pendingQueryId = 0;
     self.save();
 
-    sendTon(purchase.buyer, purchase.paid - GAS_RESERVE);
+    sendTon(purchase.buyer, purchase.paid - GAS_RESERVE - keptByNft);
 }
 
 // ---------- Обработчики ----------
@@ -283,7 +312,7 @@ fun handleBuy(sender: address, value: coins) {
     // Запоминаем покупателя и сумму: они понадобятся и при успехе, и при возврате.
     storage.state = State.Transferring;
     storage.pendingQueryId = queryId;
-    storage.purchase = Purchase { buyer: sender, paid: value, startedAt: blockchain.now() }.toCell();
+    storage.purchase = Purchase { buyer: sender, paid: value, probeSentAt: 0 }.toCell();
     storage.save();
 
     // Деньги остаются у нас. NFT — покупателю, а подтверждение (Excesses) вернётся к нам.
@@ -313,17 +342,63 @@ fun handleExcesses(sender: address, returned: coins, msg: Excesses) {
     storage.completeSale(returned);
 }
 
-// Выход из Transferring, если NFT ничего не ответил. Отправить может любой, но не раньше срока.
-fun handleSettle() {
+// Выход из Transferring, если NFT не прислал Excesses. Отправить может любой и в любой момент.
+// Мы не решаем по времени, а спрашиваем NFT: get_static_data уходит ПОСЛЕ перевода, поэтому NFT обработает
+// его после перевода, а его ответы придут к нам в том же порядке (см. «Порядок сообщений» в начале файла).
+// Ответ на запрос во время покупки (handleReportStaticData или bounce запроса) значит: перевод обработан
+// и не отвергнут, иначе bounce перевода пришёл бы раньше и уже вернул бы деньги покупателю.
+fun handleSettle(value: coins) {
+    var storage = Storage.load();
+
+    assert (storage.state == State.Transferring) throw ERR_WRONG_STATE;
+    assert (value >= SETTLE_MIN) throw ERR_WRONG_AMOUNT;
+
+    // Запоминаем время только ПЕРВОГО запроса: иначе повторными Settle можно было бы бесконечно
+    // откладывать Refund.
+    var purchase = storage.purchase!.load();
+    if (purchase.probeSentAt == 0) {
+        purchase.probeSentAt = blockchain.now();
+        storage.purchase = purchase.toCell();
+        storage.save();
+    }
+
+    // query_id тот же, что у перевода: так ответ привязан к текущей покупке.
+    // Режим 64: запрос оплачивают TON этого Settle, баланс контракта не тратится.
+    val msg = createMessage({
+        bounce: BounceMode.Only256BitsOfBody,
+        dest: storage.nftAddress,
+        value: 0,
+        body: GetStaticData { queryId: storage.pendingQueryId },
+    });
+    msg.send(SEND_MODE_CARRY_ALL_REMAINING_MESSAGE_VALUE);
+}
+
+// NFT ответил на запрос из Settle. Раз ответ пришёл, а покупка всё ещё идёт, перевод прошёл: завершаем сделку.
+fun handleReportStaticData(sender: address, msg: ReportStaticData) {
+    var storage = Storage.load();
+
+    // Те же проверки, что у Excesses: только наш NFT, только во время покупки, только текущий query_id.
+    assert (sender == storage.nftAddress) throw ERR_NOT_EXPECTED_NFT;
+    assert (storage.state == State.Transferring) throw ERR_WRONG_STATE;
+    assert (msg.queryId == storage.pendingQueryId) throw ERR_WRONG_QUERY_ID;
+
+    // Excesses не было, поэтому возврат от NFT покупателю не засчитываем.
+    storage.completeSale(0);
+}
+
+// Резервный выход, если NFT не ответил даже на запрос из Settle. Отправить может любой, но только
+// через REFUND_TIMEOUT после первого Settle. Без Settle Refund невозможен: сначала надо спросить NFT.
+fun handleRefund() {
     var storage = Storage.load();
 
     assert (storage.state == State.Transferring) throw ERR_WRONG_STATE;
     val purchase = storage.purchase!.load();
-    assert (blockchain.now() >= purchase.startedAt + SETTLE_TIMEOUT) throw ERR_TOO_EARLY;
+    assert (purchase.probeSentAt != 0) throw ERR_TOO_EARLY;
+    assert (blockchain.now() >= purchase.probeSentAt + REFUND_TIMEOUT) throw ERR_TOO_EARLY;
 
-    // Перевод шёл с bounce: провал дал бы bounce за секунды. Долгая тишина значит, что NFT перевёлся.
-    // Возврата от NFT мы не видели, поэтому в возврат покупателю его не засчитываем.
-    storage.completeSale(0);
+    // Что стало с NFT, неизвестно; NFT_TRANSFER_MIN остался у NFT. Продажа снова открыта: если NFT
+    // всё ещё у нас, продавец может его забрать (Cancel) или продать снова.
+    storage.reopenSale(NFT_TRANSFER_MIN);
 }
 
 fun handleCancel(sender: address, value: coins) {
@@ -388,10 +463,12 @@ fun onInternalMessage(in: InMessage) {
     match (msg) {
         OwnershipAssigned => handleOwnershipAssigned(in.senderAddress, in.valueCoins, msg),
         Excesses => handleExcesses(in.senderAddress, in.valueCoins, msg),
+        ReportStaticData => handleReportStaticData(in.senderAddress, msg),
         Buy => handleBuy(in.senderAddress, in.valueCoins),
         Cancel => handleCancel(in.senderAddress, in.valueCoins),
         Withdraw => handleWithdraw(in.senderAddress, in.valueCoins),
-        Settle => handleSettle(),
+        Settle => handleSettle(in.valueCoins),
+        Refund => handleRefund(),
         else => {
             // Пустое сообщение — просто пополнение баланса, остальное отвергаем.
             assert (in.body.isEmpty()) throw ERR_UNKNOWN_OP;
@@ -400,7 +477,7 @@ fun onInternalMessage(in: InMessage) {
 }
 
 // Сюда приходит наше сообщение, если получатель не смог его обработать.
-// С bounce мы отправляем только переводы NFT (в handleBuy и handleCancel).
+// С bounce мы отправляем переводы NFT (в handleBuy и handleCancel) и запрос get_static_data (в handleSettle).
 fun onBouncedMessage(in: InMessageBounced) {
     var storage = Storage.load();
 
@@ -409,21 +486,34 @@ fun onBouncedMessage(in: InMessageBounced) {
         return;
     }
 
-    // Тело bounce: 0xFFFFFFFF + начало исходного сообщения. У нашего перевода это код операции и query_id.
+    // Тело bounce: 0xFFFFFFFF + начало исходного сообщения. У наших сообщений это код операции и query_id.
     var body = in.bouncedBody;
     body.skipBouncedPrefix();
     val op = body.loadUint(32);
     val queryId = body.loadUint(64);
 
-    // Принимаем bounce только от нашего ТЕКУЩЕГО перевода. Опоздавший bounce от старого перевода
+    // Принимаем bounce только с query_id ТЕКУЩЕГО перевода. Опоздавший bounce от старого перевода
     // (например, от Cancel, отправленного в WaitingNft) с другим query_id игнорируется.
-    if (storage.pendingQueryId == 0 || op != OP_NFT_TRANSFER || queryId != storage.pendingQueryId) {
+    if (storage.pendingQueryId == 0 || queryId != storage.pendingQueryId) {
+        return;
+    }
+
+    // Запрос из Settle не обработан (например, NFT не поддерживает get_static_data). Он шёл ПОСЛЕ перевода,
+    // значит, перевод уже обработан, и если бы он был отвергнут, его bounce пришёл бы раньше этого.
+    // Раз покупка всё ещё идёт, перевод прошёл: завершаем сделку, как при ответе на запрос.
+    if (op == OP_GET_STATIC_DATA) {
+        if (storage.state == State.Transferring) {
+            storage.completeSale(0);
+        }
+        return;
+    }
+    if (op != OP_NFT_TRANSFER) {
         return;
     }
 
     if (storage.state == State.Transferring) {
-        // Не удался перевод NFT покупателю: возвращаем деньги, продажа снова открыта.
-        storage.reopenSale();
+        // Не удался перевод NFT покупателю: NFT вернул наши TON, возвращаем деньги, продажа снова открыта.
+        storage.reopenSale(0);
     } else if (storage.state == State.Cancelled) {
         // Не удался возврат NFT продавцу: NFT всё ещё у нас, даём продавцу повторить Cancel.
         storage.state = State.ForSale;
@@ -437,18 +527,20 @@ fun onBouncedMessage(in: InMessageBounced) {
 }
 
 // ---------- Get-метод ----------
-// Возвращает: state, seller, nftAddress, price, buyer (или null), paid, queryId, settleAfter.
+// Возвращает: state, seller, nftAddress, price, buyer (или null), paid, queryId, refundAfter.
 get fun swapInfo(): SwapInfo {
     val storage = Storage.load();
     var buyer: address? = null;
     var paid: coins = 0;
-    var settleAfter = 0;
+    var refundAfter = 0;
     val current = storage.purchase;
     if (current != null) {
         val purchase = current.load();
         buyer = purchase.buyer;
         paid = purchase.paid;
-        settleAfter = purchase.startedAt + SETTLE_TIMEOUT;
+        if (purchase.probeSentAt != 0) {
+            refundAfter = purchase.probeSentAt + REFUND_TIMEOUT;
+        }
     }
     return {
         state: storage.state,
@@ -458,6 +550,6 @@ get fun swapInfo(): SwapInfo {
         buyer: buyer,
         paid: paid,
         queryId: storage.pendingQueryId,
-        settleAfter: settleAfter,
+        refundAfter: refundAfter,
     };
 }

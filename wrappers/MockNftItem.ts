@@ -17,6 +17,8 @@ export const NftOpcodes = {
     transfer: 0x5fcc3d14,
     ownershipAssigned: 0x05138d91,
     excesses: 0xd53276db,
+    getStaticData: 0x2fcb26a2,
+    reportStaticData: 0x8b771735,
 };
 
 export const NftErrors = {
@@ -30,7 +32,7 @@ export type MockNftItemConfig = {
 };
 
 export function mockNftItemConfigToCell(config: MockNftItemConfig): Cell {
-    return beginCell().storeAddress(config.owner).storeBit(false).endCell(); // owner, rejectTransfers
+    return beginCell().storeAddress(config.owner).storeBit(false).storeBit(false).endCell(); // owner, rejectTransfers, skipExcesses
 }
 
 export class MockNftItem implements Contract {
@@ -67,6 +69,15 @@ export class MockNftItem implements Contract {
             value,
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: beginCell().storeUint(0x0badc0de, 32).storeBit(reject).endCell(),
+        });
+    }
+
+    // ТОЛЬКО ДЛЯ ТЕСТОВ: NFT переводится, но не присылает excesses (нестандартное поведение).
+    async sendSetSkipExcesses(provider: ContractProvider, via: Sender, value: bigint, skip: boolean) {
+        await provider.internal(via, {
+            value,
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell().storeUint(0x0badc0df, 32).storeBit(skip).endCell(),
         });
     }
 

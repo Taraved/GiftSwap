@@ -641,7 +641,6 @@ describe('GiftSwap with a TEP-62 NFT', () => {
         await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
         expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
 
-        blockchain.now = (blockchain.now ?? Math.floor(Date.now() / 1000)) + Constants.settleTimeout + 1;
         const result = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
 
         expect(result.transactions).toHaveTransaction({
@@ -650,6 +649,43 @@ describe('GiftSwap with a TEP-62 NFT', () => {
             success: false,
             exitCode: Errors.wrongState,
         });
+    });
+
+    it('an NFT that transfers but sends no excesses: settle (with SETTLE_MIN) asks it, and its real answer completes the sale', async () => {
+        await depositNft();
+        await nft.sendSetSkipExcesses(deployer.getSender(), toNano('0.05'), true);
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        expect((await nft.getOwner()).equals(buyer.address)).toBe(true);
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring); // подтверждения нет
+
+        const result = await giftSwap.sendSettle(buyer.getSender(), Constants.settleMin);
+
+        expect(result.transactions).toHaveTransaction({
+            from: nft.address,
+            to: giftSwap.address,
+            op: NftOpcodes.reportStaticData,
+            success: true,
+        });
+        expect(result.transactions).toHaveTransaction({ from: giftSwap.address, to: seller.address, value: PRICE });
+        expect(result.transactions).toHaveTransaction({
+            from: giftSwap.address,
+            to: buyer.address,
+            value: ENOUGH - PRICE - FEES,
+        });
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
+    });
+
+    it('reserve: a sale completed through settle does not drain the contract (the caller pays the probe)', async () => {
+        await depositNft();
+        await nft.sendSetSkipExcesses(deployer.getSender(), toNano('0.05'), true);
+
+        const delta = await balanceDelta(async () => {
+            await giftSwap.sendBuy(buyer.getSender(), PRICE + FEES);
+            await giftSwap.sendSettle(buyer.getSender(), Constants.settleMin);
+        });
+
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
+        expect(delta).toBeGreaterThanOrEqual(0n);
     });
 
     // ---------- Газ и константы ----------
