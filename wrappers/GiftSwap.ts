@@ -34,7 +34,7 @@ export const Opcodes = {
     refund: 0x0b5a0005,
 };
 
-// Должно совпадать с константами в contracts/gift_swap.tolk (замеры газа: см. историю коммитов шага 4)
+// Должно совпадать с константами в contracts/gift_swap.tolk (замеры: tests/GiftSwapWithNft.spec.ts, раздел «Газ и константы»)
 export const Constants = {
     nftTransferMin: toNano('0.05'), // NFT_TRANSFER_MIN: сколько прикладываем к переводу NFT
     gasReserve: toNano('0.01'), // GAS_RESERVE: запас контракта на газ и комиссии
