@@ -27,6 +27,7 @@ const ERR_WRONG_STATE = 103;        // действие не подходит т
 const ERR_WRONG_AMOUNT = 104;       // приложено слишком мало TON
 const ERR_WRONG_QUERY_ID = 105;     // Excesses не относится к текущему переводу NFT
 const ERR_TOO_EARLY = 106;          // Settle раньше срока
+const ERR_NOTHING_TO_WITHDRAW = 107; // Withdraw, когда сверх резерва выводить нечего
 const ERR_UNKNOWN_OP = 0xFFFF;      // непонятное сообщение
 
 // ---------- Деньги ----------
@@ -40,12 +41,16 @@ const GAS_RESERVE = ton("0.01");
 // Сколько остаётся на контракте после Withdraw. Плата за хранение за 10 лет ~0.014 TON (растёт с размером
 // кода и данных, поэтому её надо перемерять при каждой заметной правке контракта), значит, 0.02 хватает лет на 14.
 const WITHDRAW_KEEP = ton("0.02");
+// Меньший остаток сверх WITHDRAW_KEEP Withdraw не выводит (ERR_NOTHING_TO_WITHDRAW): вывод «пыли»
+// стоил бы продавцу больше, чем он получит.
+const WITHDRAW_MIN = ton("0.005");
 
 // ---------- Время ----------
 // Через сколько секунд после Buy можно вызвать Settle. Перевод NFT отправлен с bounce, поэтому при провале
-// ответ (bounce) приходит за секунды. Если за час нет ни bounce, ни Excesses, перевод, скорее всего, удался,
-// а NFT просто не прислал подтверждение (или прислал слишком мало TON на обработку).
-const SETTLE_TIMEOUT = 3600;
+// ответ (bounce) обычно приходит за секунды. Но при сильной перегрузке сети сообщения могут часами стоять
+// в очередях, а Settle, вызванный раньше bounce, заплатил бы продавцу за непереданный NFT. Поэтому срок
+// берём с большим запасом: сутки. Обычному NFT Settle не нужен вовсе: по TEP-62 он всегда присылает Excesses.
+const SETTLE_TIMEOUT = 24 * 3600;
 
 // Код операции перевода NFT (TEP-62). Нужен и здесь, чтобы узнать наш перевод в теле bounce.
 const OP_NFT_TRANSFER = 0x5fcc3d14;
@@ -309,7 +314,7 @@ fun handleCancel(sender: address, value: coins) {
 // Продавец забирает TON, оставшиеся на контракте (остатки депозитов, «пыль»).
 // Разрешено только там, где в контракте нет чужих денег: не в ForSale (там лежит NFT
 // и идёт отмена) и не в Transferring (там лежат деньги покупателя).
-fun handleWithdraw(sender: address) {
+fun handleWithdraw(sender: address, value: coins) {
     val storage = Storage.load();
 
     assert (sender == storage.seller) throw ERR_NOT_SELLER;
@@ -318,6 +323,11 @@ fun handleWithdraw(sender: address) {
         || storage.state == State.Sold
         || storage.state == State.Cancelled
     ) throw ERR_WRONG_STATE;
+    // Баланс на начало вычислений уже включает TON этого сообщения; вычитаем их, чтобы увидеть,
+    // сколько лежало на контракте до Withdraw. Если сверх резерва почти ничего, отказываем:
+    // bounce вернёт продавцу приложенные TON, а пустой вывод не потратит комиссию впустую.
+    val balanceBefore = contract.getOriginalBalance() - value;
+    assert (balanceBefore > WITHDRAW_KEEP + WITHDRAW_MIN) throw ERR_NOTHING_TO_WITHDRAW;
 
     // Оставляем резерв на плату за хранение, всё остальное отправляем продавцу.
     reserveGramsOnBalance(WITHDRAW_KEEP, RESERVE_MODE_EXACT_AMOUNT);
@@ -336,7 +346,7 @@ fun onInternalMessage(in: InMessage) {
         Excesses => handleExcesses(in.senderAddress, in.valueCoins, msg),
         Buy => handleBuy(in.senderAddress, in.valueCoins),
         Cancel => handleCancel(in.senderAddress, in.valueCoins),
-        Withdraw => handleWithdraw(in.senderAddress),
+        Withdraw => handleWithdraw(in.senderAddress, in.valueCoins),
         Settle => handleSettle(),
         else => {
             // Пустое сообщение — просто пополнение баланса, остальное отвергаем.

@@ -1,5 +1,5 @@
 import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
-import { Address, Cell, Transaction, toNano } from '@ton/core';
+import { Address, Cell, Transaction, beginCell, toNano } from '@ton/core';
 import { GiftSwap, Constants, Errors, SwapState } from '../wrappers/GiftSwap';
 import { MockNftItem, NftErrors, NftOpcodes } from '../wrappers/MockNftItem';
 import '@ton/test-utils';
@@ -457,6 +457,73 @@ describe('GiftSwap with a TEP-62 NFT', () => {
             success: false,
             exitCode: Errors.wrongState,
         });
+    });
+
+    // Выплаты контракта продавцу, не считая bounce (возврата его же приложенных TON).
+    const payoutsToSeller = (transactions: Transaction[]) =>
+        transactions.filter((tx) => {
+            const info = tx.inMessage?.info;
+            return (
+                info?.type === 'internal' &&
+                !info.bounced &&
+                info.src.equals(giftSwap.address) &&
+                info.dest.equals(seller.address)
+            );
+        });
+
+    it('withdraw with nothing left over is rejected (107): no payout, the reserve stays', async () => {
+        await depositNft();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        await giftSwap.sendWithdraw(seller.getSender(), toNano('0.05')); // забрал всё сверх резерва
+        const before = await balanceOf(giftSwap.address);
+
+        const result = await giftSwap.sendWithdraw(seller.getSender(), toNano('0.05'));
+
+        expect(result.transactions).toHaveTransaction({
+            from: seller.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.nothingToWithdraw,
+        });
+        expect(payoutsToSeller(result.transactions)).toHaveLength(0);
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(before - toNano('0.0001'));
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(KEEP);
+    });
+
+    it('withdraw works again once new leftovers arrive (a plain top-up)', async () => {
+        await depositNft();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        await giftSwap.sendWithdraw(seller.getSender(), toNano('0.05'));
+        await deployer.send({ to: giftSwap.address, value: toNano('0.1') }); // пустое тело: пополнение
+
+        const result = await giftSwap.sendWithdraw(seller.getSender(), toNano('0.05'));
+
+        const payouts = payoutsToSeller(result.transactions);
+        expect(payouts).toHaveLength(1);
+        const sent = (payouts[0].inMessage!.info as any).value.coins as bigint;
+        expect(sent).toBeGreaterThan(toNano('0.1')); // пополнение плюс его же приложенные 0.05, минус комиссии
+    });
+
+    it('attack: spam from a stranger (Withdraw, Cancel, Settle, Buy, junk) never lowers the contract balance', async () => {
+        await depositNft();
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH); // Sold: на контракте остаток продавца
+        const before = await balanceOf(giftSwap.address);
+
+        for (const value of [toNano('0.001'), toNano('0.05')]) {
+            await giftSwap.sendWithdraw(attacker.getSender(), value);
+            await giftSwap.sendCancel(attacker.getSender(), value);
+            await giftSwap.sendSettle(attacker.getSender(), value);
+            await giftSwap.sendBuy(attacker.getSender(), value);
+            await attacker.send({
+                to: giftSwap.address,
+                value,
+                body: beginCell().storeUint(0x12345678, 32).endCell(),
+            });
+        }
+
+        // Газ отвергнутых сообщений оплачивают их же TON, баланс контракта не тратится.
+        expect(await balanceOf(giftSwap.address)).toBeGreaterThanOrEqual(before - toNano('0.0001'));
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Sold);
     });
 
     // ---------- Привязка ответов NFT к покупке и Settle ----------

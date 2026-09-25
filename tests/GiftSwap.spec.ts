@@ -688,6 +688,26 @@ describe('GiftSwap', () => {
         expect(info.settleAfter).toBe(0);
     });
 
+    it('settle is still rejected 23 hours after the buy (a congested network can delay the bounce for hours)', async () => {
+        await deposit();
+        const boughtAt = Math.floor(Date.now() / 1000);
+        blockchain.now = boughtAt;
+        await giftSwap.sendBuy(buyer.getSender(), ENOUGH);
+        expect((await giftSwap.getSwapInfo()).settleAfter).toBeGreaterThanOrEqual(boughtAt + 24 * 3600);
+
+        blockchain.now = boughtAt + 23 * 3600;
+        const result = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
+
+        expect(result.transactions).toHaveTransaction({
+            from: attacker.address,
+            to: giftSwap.address,
+            success: false,
+            exitCode: Errors.tooEarly,
+        });
+        expect(result.transactions).not.toHaveTransaction({ from: giftSwap.address, to: seller.address });
+        expect((await giftSwap.getSwapInfo()).state).toBe(SwapState.Transferring);
+    });
+
     it('settle is rejected when no purchase is in progress (ForSale and Sold)', async () => {
         await deposit();
         const forSale = await giftSwap.sendSettle(attacker.getSender(), toNano('0.05'));
